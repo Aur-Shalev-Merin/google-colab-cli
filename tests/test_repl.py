@@ -19,6 +19,16 @@ from typer.testing import CliRunner
 
 from colab_cli.cli import app
 from colab_cli.repl import ColabREPL
+from prompt_toolkit.application import create_app_session
+from prompt_toolkit.output import DummyOutput
+
+
+@pytest.fixture(autouse=True)
+def _dummy_terminal_output():
+    """Keeps PromptSession off the real terminal, which on Windows requires an
+    attached console (absent under CI and most test runners)."""
+    with create_app_session(output=DummyOutput()):
+        yield
 
 runner = CliRunner()
 

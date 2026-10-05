@@ -15,12 +15,14 @@
 import json
 import os
 import sys
-import termios
 from unittest.mock import MagicMock, patch
 
 from colab_cli.console import connect_console, on_message, on_open
 from colab_cli.state import SessionState
 import pytest
+
+# These tests cover the POSIX termios raw-mode path.
+termios = pytest.importorskip("termios")
 
 
 @pytest.fixture

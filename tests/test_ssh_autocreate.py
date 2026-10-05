@@ -316,7 +316,9 @@ def test_proxy_mode_signal_handler_installation(
     assert result.exit_code == 0
     if expect_installed:
         registered = {c.args[0] for c in sigmock.call_args_list}
-        assert {_signal.SIGHUP, _signal.SIGTERM, _signal.SIGINT} <= registered
+        # SIGHUP does not exist on Windows.
+        expected = {getattr(_signal, "SIGHUP", None), _signal.SIGTERM, _signal.SIGINT}
+        assert expected - {None} <= registered
     else:
         sigmock.assert_not_called()
 

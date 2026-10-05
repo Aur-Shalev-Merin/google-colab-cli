@@ -238,6 +238,31 @@ def test_bridge_proxy_mode_pumps_ws_to_stdout(mocker):
 # --- ProxyCommand shell quoting ---------------------------------------------
 
 
+def _split_command_line(cmd):
+    """Parses a command line the way the platform's ssh ProxyCommand does.
+
+    POSIX ssh hands it to /bin/sh; Windows OpenSSH passes it straight to
+    CreateProcessW, whose argv parsing is CommandLineToArgvW.
+    """
+    if sys.platform != "win32":
+        return shlex.split(cmd)
+    import ctypes
+    from ctypes import wintypes
+
+    shell32 = ctypes.windll.shell32
+    shell32.CommandLineToArgvW.argtypes = [
+        wintypes.LPCWSTR,
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    shell32.CommandLineToArgvW.restype = ctypes.POINTER(wintypes.LPWSTR)
+    argc = ctypes.c_int()
+    argv = shell32.CommandLineToArgvW(cmd, ctypes.byref(argc))
+    try:
+        return [argv[i] for i in range(argc.value)]
+    finally:
+        ctypes.windll.kernel32.LocalFree(argv)
+
+
 @pytest.mark.parametrize(
     "name",
     [
@@ -270,7 +295,10 @@ def test_proxy_command_round_trips_through_the_shell(name, identity):
     literal argument, never as a new word or a substitution.
     """
     cmd = ssh_module._proxy_command(_make_session(name=name), identity)
-    argv = shlex.split(cmd)
+    argv = _split_command_line(cmd)
+    if sys.platform == "win32":
+        # The interpreter path is emitted with forward slashes on Windows.
+        argv[0] = argv[0].replace("/", "\\")
 
     assert argv[:7] == [
         sys.executable,

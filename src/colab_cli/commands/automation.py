@@ -102,7 +102,9 @@ def run_automation(
                 state.history.log_event(s.name, "drive_auth_needed", {"uri": uri})
                 sys.stdout.write("Press Enter after you have granted access... ")
                 sys.stdout.flush()
-                with open("/dev/tty") as tty:
+                # Read from the terminal even if stdin is piped.
+                tty_path = "CONIN$" if sys.platform == "win32" else "/dev/tty"
+                with open(tty_path) as tty:
                     tty.readline()
 
             typer.echo("[colab] Authorizing VM...")

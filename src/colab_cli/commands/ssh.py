@@ -360,9 +360,12 @@ def _bridge_proxy_mode(ws: websocket.WebSocket) -> int:
     def stdin_to_ws():
         try:
             while True:
-                ready, _, _ = select.select([stdin_fd], [], [], None)
-                if not ready:
-                    continue
+                # select() only accepts sockets on Windows; a blocking read in
+                # this dedicated thread is equivalent there.
+                if sys.platform != "win32":
+                    ready, _, _ = select.select([stdin_fd], [], [], None)
+                    if not ready:
+                        continue
                 data = os.read(stdin_fd, 8192)
                 if not data:
                     break
@@ -409,6 +412,14 @@ def _proxy_command(session: SessionState, identity: Optional[str]) -> str:
     ]
     if identity:
         self_cmd.extend(["--identity", identity])
+    if sys.platform == "win32":
+        # Windows OpenSSH runs ProxyCommand via CreateProcessW (no shell), while
+        # Git for Windows' ssh runs it via /bin/sh. Double quotes parse the same
+        # way in both (except `$` and backticks in a session name, which sh
+        # still expands), and forward slashes keep sh from eating the path's
+        # backslashes (CreateProcessW accepts either separator).
+        self_cmd[0] = self_cmd[0].replace("\\", "/")
+        return subprocess.list2cmdline(self_cmd)
     return shlex.join(self_cmd)
 
 
@@ -421,7 +432,7 @@ def _ssh_base_args(proxy_command: str, identity: Optional[str]) -> list[str]:
         "-o",
         "StrictHostKeyChecking=no",
         "-o",
-        "UserKnownHostsFile=/dev/null",
+        f"UserKnownHostsFile={os.devnull}",
         "-o",
         "LogLevel=ERROR",
     ]
@@ -546,7 +557,9 @@ def _install_rm_signal_handlers(do_rm: Callable[[], None]) -> None:
         do_rm()
         os._exit(0)
 
-    for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
+    # SIGHUP does not exist on Windows.
+    sigs = (getattr(signal, "SIGHUP", None), signal.SIGTERM, signal.SIGINT)
+    for sig in filter(None, sigs):
         try:
             signal.signal(sig, _on_signal)
         except (ValueError, OSError):

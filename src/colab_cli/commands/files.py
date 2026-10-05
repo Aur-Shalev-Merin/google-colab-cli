@@ -154,9 +154,12 @@ def edit(
 
     _, ext = os.path.splitext(remote_path)
 
-    with tempfile.NamedTemporaryFile(suffix=ext) as tf:
+    # delete=False + explicit cleanup: Windows can't reopen a
+    # NamedTemporaryFile by name while it is still open.
+    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tf:
         local_path = tf.name
 
+    try:
         try:
             contents.download(remote_path, local_path)
         except Exception:
@@ -179,6 +182,8 @@ def edit(
             typer.echo(f"[colab] Edited and uploaded '{remote_path}'")
         else:
             typer.echo(f"[colab] No changes made to '{remote_path}'")
+    finally:
+        os.unlink(local_path)
 
 
 def register(app: typer.Typer):

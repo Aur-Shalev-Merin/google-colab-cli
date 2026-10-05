@@ -12,16 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import codecs
 import json
 import logging
 import os
 import signal
 import sys
-import termios
 import threading
 import time
-import tty
 from urllib.parse import urlparse
+
+if sys.platform == "win32":
+    import ctypes
+    import msvcrt
+
+    termios = tty = None
+else:
+    import termios
+    import tty
 
 import websocket
 
@@ -78,6 +86,32 @@ def send_terminal_size(ws):
         logger.debug(f"Failed to send terminal size: {e}")
 
 
+def _raw_console_reader():
+    """Returns a callable reading keystrokes from an interactive stdin.
+
+    On Windows, text-mode ``sys.stdin`` translates newlines and holds back a
+    lone ``\\r`` (Enter) until the next key arrives to see whether ``\\n``
+    follows, so Enter would reach the remote shell one keystroke late. There we
+    read the console's raw bytes and decode them ourselves; elsewhere stdin
+    does no translation and ``read(1)`` is fine.
+    """
+    if sys.platform != "win32":
+        return lambda: sys.stdin.read(1)
+
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+    def read():
+        while True:
+            data = sys.stdin.buffer.read1(1024)
+            if not data:
+                return ""
+            text = decoder.decode(data)
+            if text:  # empty while a multi-byte character is incomplete
+                return text
+
+    return read
+
+
 def on_open(ws):
     """Callback for when the websocket connection is opened."""
     global _is_running
@@ -89,10 +123,11 @@ def on_open(ws):
     # Setup the background thread to read from stdin
     def read_stdin():
         is_tty = sys.stdin.isatty()
+        read_char = _raw_console_reader() if is_tty else lambda: sys.stdin.read(1)
         while _is_running:
             try:
                 # Read a single character (or escape sequence byte)
-                char = sys.stdin.read(1)
+                char = read_char()
                 if not char:
                     if not is_tty:
                         # Piped input has reached EOF. The remote /colab/tty
@@ -120,6 +155,65 @@ def on_open(ws):
     thread.start()
 
 
+# Windows console mode flags (see SetConsoleMode docs).
+_ENABLE_PROCESSED_INPUT = 0x0001
+_ENABLE_LINE_INPUT = 0x0002
+_ENABLE_ECHO_INPUT = 0x0004
+_ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200
+_ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+
+
+def _enter_raw_mode_windows(fd):
+    """Puts the Windows console into a raw, VT-sequence mode.
+
+    Disables line buffering, echo and Ctrl-C processing on stdin (so keys,
+    including Ctrl-C, are forwarded to the remote shell) and enables VT input
+    so arrow keys arrive as ANSI escape sequences, matching what a POSIX raw
+    tty would deliver. Enables VT processing on stdout so the remote shell's
+    ANSI output renders. Returns a callable that restores the original modes.
+    """
+    kernel32 = ctypes.windll.kernel32
+    in_handle = msvcrt.get_osfhandle(fd)
+    out_handle = msvcrt.get_osfhandle(sys.stdout.fileno())
+
+    old_in, old_out = ctypes.c_uint32(), ctypes.c_uint32()
+    kernel32.GetConsoleMode(in_handle, ctypes.byref(old_in))
+    has_out = kernel32.GetConsoleMode(out_handle, ctypes.byref(old_out))
+
+    raw_in = old_in.value & ~(
+        _ENABLE_PROCESSED_INPUT | _ENABLE_LINE_INPUT | _ENABLE_ECHO_INPUT
+    )
+    kernel32.SetConsoleMode(in_handle, raw_in | _ENABLE_VIRTUAL_TERMINAL_INPUT)
+    if has_out:
+        kernel32.SetConsoleMode(
+            out_handle, old_out.value | _ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        )
+
+    def restore():
+        kernel32.SetConsoleMode(in_handle, old_in.value)
+        if has_out:
+            kernel32.SetConsoleMode(out_handle, old_out.value)
+
+    return restore
+
+
+def _enter_raw_mode(fd, on_resize):
+    """Switches the local terminal to raw mode; returns a restore callable."""
+    if sys.platform == "win32":
+        # Windows has no SIGWINCH; the initial size sent on open is used.
+        return _enter_raw_mode_windows(fd)
+
+    old_settings = termios.tcgetattr(fd)
+    tty.setraw(fd, termios.TCSANOW)
+    signal.signal(signal.SIGWINCH, on_resize)
+
+    def restore():
+        termios.tcsetattr(fd, termios.TCSANOW, old_settings)
+        signal.signal(signal.SIGWINCH, signal.SIG_DFL)
+
+    return restore
+
+
 def connect_console(session: SessionState):
     """
     Connects to the Colab TTY endpoint and sets up a raw terminal session.
@@ -134,7 +228,7 @@ def connect_console(session: SessionState):
 
     is_tty = sys.stdin.isatty()
     fd = sys.stdin.fileno() if is_tty else None
-    old_settings = termios.tcgetattr(fd) if is_tty else None
+    restore_terminal = None
 
     ws = websocket.WebSocketApp(
         url=ws_url,
@@ -151,8 +245,7 @@ def connect_console(session: SessionState):
 
     try:
         if is_tty:
-            tty.setraw(fd, termios.TCSANOW)
-            signal.signal(signal.SIGWINCH, handle_sigwinch)
+            restore_terminal = _enter_raw_mode(fd, handle_sigwinch)
 
         # This is a blocking call until the connection is closed
         ws.run_forever()
@@ -164,9 +257,7 @@ def connect_console(session: SessionState):
                 # We raise a standard exception that the caller can recognize
                 raise RuntimeError(f"Connection failed: {err_msg}")
     finally:
-        if is_tty:
+        if restore_terminal:
             # Always ensure the terminal is restored to its original state
-            termios.tcsetattr(fd, termios.TCSANOW, old_settings)
-            # Restore the default signal handler for resize
-            signal.signal(signal.SIGWINCH, signal.SIG_DFL)
+            restore_terminal()
         print("\r\nConnection closed.")

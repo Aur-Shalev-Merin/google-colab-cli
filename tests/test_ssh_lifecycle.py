@@ -252,7 +252,9 @@ def test_proxy_mode_rm_teardown_idempotent(mock_common_state, mocker):
     )
 
     def bridge_then_hup(ws):
-        handlers[_signal.SIGHUP](_signal.SIGHUP, None)  # OpenSSH HUPs us
+        # OpenSSH HUPs us (Windows has no SIGHUP; SIGTERM shares the handler).
+        sig = getattr(_signal, "SIGHUP", _signal.SIGTERM)
+        handlers[sig](sig, None)
         return 0
 
     mocker.patch.object(
